@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-from Torch import Tensor
+import torch.nn.init as init
+from torch import Tensor
 from torchvision.transforms import Compose, Resize, ToTensor
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange, Reduce
@@ -9,11 +10,11 @@ from torchsummary import summary
 import config
 
 class Embedding(nn.Module):
-'''
-input: original_image
-output: patchfied pos enbedded tensor(z0 in paper)
-        dim : [mini_batch_size, #patches +1, dim_model]
-'''
+    '''
+    input: original_image
+    output: patchfied pos enbedded tensor(z0 in paper)
+            dim : [mini_batch_size, #patches +1, dim_model]
+    '''
     def __init__(self):
         super().__init__()
         self.img_size = config.img_size
@@ -31,15 +32,15 @@ output: patchfied pos enbedded tensor(z0 in paper)
 
     def forward(self, image):
         def patchify(image, patch_size, img_size):
-        '''
-        input
-            - image : original image
-            - patch_size : a length of a patch
-            - img_size : target length after resize the original image
+            '''
+            input
+                - image : original image
+                - patch_size : a length of a patch
+                - img_size : target length after resize the original image
 
-        output
-            - patchified tensor, dim : [batch_size,#patch,(patch_size**2)*#channel]
-        '''
+            output
+                - patchified tensor, dim : [batch_size,#patch,(patch_size**2)*#channel]
+            '''
             transform = Compose([Resize((img_size, img_size)), ToTensor()])
             x = transform(image)
             x = x.unsqueeze(0)
@@ -56,18 +57,46 @@ output: patchfied pos enbedded tensor(z0 in paper)
                                b = patches.size(0))
 
         #z0 = [b * [x_class, x1p,x2p,...xnp]], shape :(n+1, dim_model)
-        z = torch.cat([x_class, embedded], dm=1)
+        z = torch.cat([x_class, embedded], dim=1)
         z = z + pos_embedding #Positional embedding
         return z
+
+class MultiheadAttention(nn.Module):
+    def __init__(self, dropout = 0.):
+        super().__init__()
+        self.emb_size = config.dim_model
+        self.num_heads = config.num_head
+        self.qkv = nn.Linear(self.emb_size, self.emb_size*3)
+        self.att_drop = nn.Dropout(dropout)
+        self.projection = nn.Linear(self.emb_size, self.emb_size)
+
+    def forward(self, x, mask= None):
+        qkv = rearrange(self.qkv(x), "b n (h d qkv) -> (qkv) b h n d", \
+                        h = self.num_heads, qkv=3)
+        queries, keys, values = qkv[0], qkv[1], qkv[2]
+
+        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys)
+        if mask is not None:
+            fill_value = torch.finfo(torch.float32).min
+            energy.mask_fill(~mask, fill_value)
+
+        scaling = self.emb_size **(1/2)
+        att = F.softmax(energy, dim=-1) / scaling
+        att = self.att_drop(att)
+        out = torch.einsum('bhal, bhlv -> bhav ', att, values)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.projection(out)
+        return out
+
 
 class ResidualAdd(nn.Module):
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x, **kwargs):
+    def forward(self, x):
         res = x
-        x = self.fn(x, **kwargs)
+        x = self.fn(x)
         x += res
         return x
 
@@ -81,20 +110,20 @@ class FFN(nn.Sequential):
         )
 
 class TransformerEncoderLayer(nn.Sequential):
-'''
-input:z_(k-1), dim: [#mini_batch, #patches per each mini_batch, dim_model]
-    - num_head: number of heads of MHA
-    - drop_p : dropout rate of Dropout right after MHA and FFN
-    - forward_expansion: expansion argument of FFN
-    - forward_drop_p : dropout rate of FFN
+    '''
+    input:z_(k-1), dim: [#mini_batch, #patches per each mini_batch, dim_model]
+        - num_head: number of heads of MHA
+        - drop_p : dropout rate of Dropout right after MHA and FFN
+        - forward_expansion: expansion argument of FFN
+        - forward_drop_p : dropout rate of FFN
 
-output:z_k, dim: same as dim of input tensor
-'''
-    def __init__(self, num_head, drop_p =0. forwrad_expansion=4, \
-                 forward_drop_p = 0., **kwargs):
+    output:z_k, dim: same as dim of input tensor
+    '''
+    def __init__(self, num_head, drop_p =0., forward_expansion=4, \
+                 forward_drop_p = 0.):
         super().__init__(
             ResidualAdd(nn.Sequential(nn.LayerNorm(config.dim_model),\
-                            nn.MultiHeadAttention(config.dim_model,num_head),\
+                            MultiheadAttention(),\
                             nn.Dropout(drop_p)
                             )),
 
@@ -105,15 +134,15 @@ output:z_k, dim: same as dim of input tensor
                                       )))
 
 class TransformerEncoder(nn.Sequential):
-'''
-input:z_0, dim: [#mini_batch, #patches per each mini_batch, dim_model]
-    - num_head: number of heads of MHA
-    - drop_p : dropout rate of Dropout right after MHA and FFN
-    - forward_expansion: expansion argument of FFN
-    - forward_drop_p : dropout rate of FFN
+    '''
+    input:z_0, dim: [#mini_batch, #patches per each mini_batch, dim_model]
+        - num_head: number of heads of MHA
+        - drop_p : dropout rate of Dropout right after MHA and FFN
+        - forward_expansion: expansion argument of FFN
+        - forward_drop_p : dropout rate of FFN
 
-output:z_L, dim: same as dim of input tensor
-'''
+    output:z_L, dim: same as dim of input tensor
+    '''
     def __init__(self, **kwargs):
         super().__init__(*[TransformerEncoderLayer(**kwargs)\
                            for _ in range(config.depth)])
